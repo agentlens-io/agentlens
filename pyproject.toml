@@ -18,9 +18,9 @@ postgres = ["psycopg2-binary>=2.9"]
 dev = ["pytest", "pytest-asyncio", "anthropic"]
 
 [project.urls]
-Homepage = "https://github.com/wolve/agentlens"
-Repository = "https://github.com/wolve/agentlens"
-Issues = "https://github.com/wolve/agentlens/issues"
+Homepage = "https://github.com/wolvesgale/agentlens"
+Repository = "https://github.com/wolvesgale/agentlens"
+Issues = "https://github.com/wolvesgale/agentlens/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agentlens"]
