@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, List
 import json
 
 
@@ -18,6 +18,7 @@ class ToolUseEvent:
     model: str = ""
     timestamp: str = field(default_factory=_now)
     session_id: Optional[str] = None
+    violations: List[dict] = field(default_factory=list)  # populated by rules.check()
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)

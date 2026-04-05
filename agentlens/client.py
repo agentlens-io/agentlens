@@ -1,11 +1,23 @@
 import uuid
-from typing import Any, Optional
+from dataclasses import asdict
+from typing import Any, Callable, List, Optional
 
 import anthropic
 
 from .models import ToolUseEvent, ToolResultEvent
+from .rules import check, Violation
 from .writers.base import BaseWriter
 from .writers.file import FileWriter
+
+OnViolation = Callable[[ToolUseEvent, List[Violation]], None]
+
+
+def _default_on_violation(event: ToolUseEvent, violations: List[Violation]) -> None:
+    for v in violations:
+        print(
+            f"[agentlens] {v.severity.upper()} {v.rule_id}: {v.description} "
+            f"(tool={event.tool_name}, matched='{v.matched_value}')"
+        )
 
 
 class AuditedMessages:
@@ -16,10 +28,17 @@ class AuditedMessages:
     The original request/response is never modified.
     """
 
-    def __init__(self, client: anthropic.Anthropic, writer: BaseWriter, session_id: str):
+    def __init__(
+        self,
+        client: anthropic.Anthropic,
+        writer: BaseWriter,
+        session_id: str,
+        on_violation: OnViolation,
+    ):
         self._client = client
         self._writer = writer
         self._session_id = session_id
+        self._on_violation = on_violation
 
     def create(self, **kwargs) -> Any:
         # --- Capture tool_result blocks from inbound messages ---
@@ -44,13 +63,18 @@ class AuditedMessages:
         # --- Capture tool_use blocks from response ---
         for block in response.content:
             if getattr(block, "type", None) == "tool_use":
-                self._writer.write(ToolUseEvent(
+                event = ToolUseEvent(
                     tool_use_id=block.id,
                     tool_name=block.name,
                     tool_input=block.input,
                     model=response.model,
                     session_id=self._session_id,
-                ))
+                )
+                violations = check(event)
+                if violations:
+                    event.violations = [asdict(v) for v in violations]
+                    self._on_violation(event, violations)
+                self._writer.write(event)
 
         return response
 
@@ -76,9 +100,13 @@ class AuditedAnthropic:
         writer: Optional[BaseWriter] = None,
         log_path: str = "./agentlens_audit.jsonl",
         session_id: Optional[str] = None,
+        on_violation: Optional[OnViolation] = None,
         **anthropic_kwargs,
     ):
         self._client = anthropic.Anthropic(**anthropic_kwargs)
         self._writer = writer or FileWriter(log_path)
         self._session_id = session_id or str(uuid.uuid4())
-        self.messages = AuditedMessages(self._client, self._writer, self._session_id)
+        self._on_violation = on_violation or _default_on_violation
+        self.messages = AuditedMessages(
+            self._client, self._writer, self._session_id, self._on_violation
+        )
