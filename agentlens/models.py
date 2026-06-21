@@ -34,7 +34,8 @@ class ToolUseEvent:
     model: str = ""
     timestamp: str = field(default_factory=_now)
     session_id: Optional[str] = None
-    violations: List[dict] = field(default_factory=list)  # populated by rules.check()
+    violations: List[dict] = field(default_factory=list)           # active violations (after whitelist)
+    suppressed_violations: List[dict] = field(default_factory=list) # whitelist-suppressed violations
     entry_hash: str = ""  # SHA-256 hash chain (set by FileWriter)
 
     def to_json(self) -> str:

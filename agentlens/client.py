@@ -6,6 +6,7 @@ import anthropic
 
 from .models import ToolUseEvent, ToolResultEvent, PreExecutionBlockedError
 from .rules import check, Violation
+from .whitelist import Whitelist, WhitelistRule
 from .writers.base import BaseWriter
 from .writers.file import FileWriter
 
@@ -49,12 +50,14 @@ class AuditedMessages:
         session_id: str,
         on_violation: OnViolation,
         on_pre_execution: OnPreExecution,
+        whitelist: Optional[Whitelist] = None,
     ):
         self._client = client
         self._writer = writer
         self._session_id = session_id
         self._on_violation = on_violation
         self._on_pre_execution = on_pre_execution
+        self._whitelist = whitelist
 
     def create(self, **kwargs) -> Any:
         # ── 1. Capture tool_result blocks from inbound messages ──
@@ -90,7 +93,17 @@ class AuditedMessages:
                 model=response.model,
                 session_id=self._session_id,
             )
-            violations = check(event)
+            all_violations = check(event)
+
+            # Apply whitelist: partition into active vs suppressed
+            if self._whitelist and all_violations:
+                active_violations, suppressed = self._whitelist.filter(event, all_violations)
+                if suppressed:
+                    event.suppressed_violations = suppressed
+            else:
+                active_violations = all_violations
+
+            violations = active_violations
             if violations:
                 event.violations = [asdict(v) for v in violations]
                 self._on_violation(event, violations)
@@ -152,6 +165,7 @@ class AuditedAnthropic:
         on_violation: Optional[OnViolation] = None,
         on_pre_execution: Optional[OnPreExecution] = None,
         block_on_critical: bool = False,
+        whitelist: Optional[Whitelist] = None,
         **anthropic_kwargs,
     ):
         self._client = anthropic.Anthropic(**anthropic_kwargs)
@@ -171,4 +185,5 @@ class AuditedAnthropic:
             self._session_id,
             self._on_violation,
             self._on_pre_execution,
+            whitelist=whitelist,
         )
