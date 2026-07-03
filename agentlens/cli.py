@@ -244,6 +244,7 @@ def main(argv: Optional[list] = None) -> None:
         print("  python -m agentlens view <file.jsonl> [--session ID] [--violations-only]")
         print("  python -m agentlens summary <file.jsonl>")
         print("  python -m agentlens verify <file.jsonl>")
+        print("  agentlens hook <pre|post|install> [--log PATH] [--block critical|high|off]")
         sys.exit(1)
 
     if not args:
@@ -276,6 +277,10 @@ def main(argv: Optional[list] = None) -> None:
         if len(args) < 2:
             usage()
         cmd_verify(Path(args[1]))
+
+    elif subcmd == "hook":
+        from .hooks import main_hook
+        main_hook(args[1:])
 
     else:
         usage()

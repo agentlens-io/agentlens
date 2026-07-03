@@ -1,14 +1,50 @@
 # agentlens
 
-Audit logging for Claude AI agents. Transparent, append-only, OSS.
+Tamper-evident audit logging for Claude agents — **Claude Code hooks** and Anthropic SDK. Local-first, append-only, OSS.
 
 ## Why
 
 Anthropic logs API calls for their own safety monitoring — but that log is not yours.
 When your Claude-powered agent takes an action, you need your own tamper-evident record:
-for compliance, incident response, and accountability.
+for compliance (EU AI Act Art. 12, ISO/IEC 42001 A.6.2.8), incident response, and accountability.
 
-**agentlens** is a drop-in wrapper around the Anthropic SDK that captures every `tool_use` and `tool_result` event — without modifying requests or responses.
+**agentlens** captures every `tool_use` / `tool_result` event into a SHA-256 hash-chained JSONL file on your own machine — via **Claude Code hooks** (recommended) or as a drop-in Anthropic SDK wrapper. It can also **block dangerous tool calls before they execute** (deterministic rules, no LLM in the loop).
+
+## Quickstart: Claude Code / Claude Agent SDK (v0.6.0+)
+
+```bash
+pip install agentlens-io
+agentlens hook install   # prints the settings.json snippet
+```
+
+`.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "*", "hooks": [
+        {"type": "command", "command": "agentlens hook pre --log ~/.agentlens/audit.jsonl --block critical"}
+      ]}
+    ],
+    "PostToolUse": [
+      {"matcher": "*", "hooks": [
+        {"type": "command", "command": "agentlens hook post --log ~/.agentlens/audit.jsonl"}
+      ]}
+    ]
+  }
+}
+```
+
+Now every tool call in Claude Code is audit-logged, and `rm -rf /`-class commands are denied before execution:
+
+```bash
+agentlens view   ~/.agentlens/audit.jsonl        # colorized event viewer
+agentlens summary ~/.agentlens/audit.jsonl       # per-session stats
+agentlens verify ~/.agentlens/audit.jsonl        # ✅ hash-chain integrity / ❌ tamper detected
+```
+
+Options: `--block critical|high|off` (default `critical`), `--whitelist rules.json` (false-positive suppression — suppressed violations stay in the log), `--standalone` (post-hook logs tool_use+result when no pre-hook is registered). Hooks are **fail-open**: the logger can never break your agent loop.
 
 ## Design principles
 
@@ -17,13 +53,7 @@ for compliance, incident response, and accountability.
 - **No AI in the logger** — capture logic is deterministic code, not an LLM
 - **Your data stays local** — FileWriter (default) writes to your own machine; no data leaves your environment
 
-## Install
-
-```bash
-pip install agentlens-io
-```
-
-## Usage
+## Usage: SDK wrapper
 
 ```python
 from agentlens import AuditedAnthropic

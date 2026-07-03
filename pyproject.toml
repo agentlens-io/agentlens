@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentlens-io"
-version = "0.5.0"
+version = "0.6.0"
 description = "Audit logging for Claude AI agents — transparent, tamper-evident, OSS"
 readme = "README.md"
 license = "MIT"
