@@ -1,6 +1,6 @@
 import uuid
 from dataclasses import asdict
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional
 
 import anthropic
 
@@ -30,22 +30,18 @@ def _make_pre_execution_hook(block_on_critical: bool) -> OnPreExecution:
     return hook
 
 
-class AuditedMessages:
-    """Wraps anthropic.resources.Messages.
-    Intercepts every create() call to:
-      1. Capture tool_result blocks in inbound messages (post-execution facts)
-      2. Capture tool_use blocks in the response (what Claude decided to do)
-      3. Run danger rules — emit violations via on_violation
-      4. Run pre-execution hook — can raise PreExecutionBlockedError to stop execution
+class _AuditCore:
+    """Shared interception logic for the sync and async Messages wrappers.
 
-    The original request/response is never modified.
-    If PreExecutionBlockedError is raised, the event is written to the log first,
-    then the exception propagates to the caller — response is withheld.
+    The network call (messages.create) differs between sync/async, but the
+    capture → rule-check → whitelist → write → pre-execution-gate logic is
+    identical. That logic lives here so both wrappers stay byte-for-byte
+    consistent. Subclasses implement create()/async create() only.
     """
 
     def __init__(
         self,
-        client: anthropic.Anthropic,
+        client: Any,
         writer: BaseWriter,
         session_id: str,
         on_violation: OnViolation,
@@ -59,8 +55,8 @@ class AuditedMessages:
         self._on_pre_execution = on_pre_execution
         self._whitelist = whitelist
 
-    def create(self, **kwargs) -> Any:
-        # ── 1. Capture tool_result blocks from inbound messages ──
+    def _capture_tool_results(self, kwargs: dict) -> None:
+        """Capture tool_result blocks from inbound messages (post-execution facts)."""
         for msg in kwargs.get("messages", []):
             if msg.get("role") != "user":
                 continue
@@ -76,11 +72,13 @@ class AuditedMessages:
                         session_id=self._session_id,
                     ))
 
-        # ── 2. Forward to Anthropic API (read-only) ──
-        response = self._client.messages.create(**kwargs)
+    def _process_response(self, response: Any) -> None:
+        """Capture tool_use blocks → check rules → whitelist → write → pre-execution gate.
 
-        # ── 3 & 4. Capture tool_use → check rules → pre-execution gate ──
-        block_to_raise: Optional[Tuple[PreExecutionBlockedError]] = None
+        The original response is never modified. If a pre-execution hook raises,
+        every event is written to the log first, then the exception propagates.
+        """
+        block_to_raise: Optional[PreExecutionBlockedError] = None
 
         for block in response.content:
             if getattr(block, "type", None) != "tool_use":
@@ -122,6 +120,34 @@ class AuditedMessages:
         if block_to_raise is not None:
             raise block_to_raise
 
+
+class AuditedMessages(_AuditCore):
+    """Wraps anthropic.resources.Messages (synchronous).
+
+    Intercepts every create() call to capture tool_result / tool_use events,
+    run danger rules, and gate execution via the pre-execution hook.
+    The original request/response is never modified.
+    """
+
+    def create(self, **kwargs) -> Any:
+        self._capture_tool_results(kwargs)
+        response = self._client.messages.create(**kwargs)   # read-only forward
+        self._process_response(response)
+        return response
+
+
+class AsyncAuditedMessages(_AuditCore):
+    """Wraps anthropic.resources.AsyncMessages (asynchronous).
+
+    Identical interception to AuditedMessages; only the API call is awaited.
+    Audit writes remain synchronous (fast append-only I/O), preserving the
+    "logger is deterministic code" principle.
+    """
+
+    async def create(self, **kwargs) -> Any:
+        self._capture_tool_results(kwargs)
+        response = await self._client.messages.create(**kwargs)   # read-only forward
+        self._process_response(response)
         return response
 
 
@@ -180,6 +206,60 @@ class AuditedAnthropic:
             self._on_pre_execution = _make_pre_execution_hook(block_on_critical)
 
         self.messages = AuditedMessages(
+            self._client,
+            self._writer,
+            self._session_id,
+            self._on_violation,
+            self._on_pre_execution,
+            whitelist=whitelist,
+        )
+
+
+class AsyncAuditedAnthropic:
+    """Drop-in replacement for anthropic.AsyncAnthropic that adds audit logging.
+
+    Async counterpart of AuditedAnthropic — same audit/blocking behavior, for
+    codebases built on the asynchronous Anthropic client.
+
+    Usage:
+        from agentlens import AsyncAuditedAnthropic
+
+        client = AsyncAuditedAnthropic(log_path="./audit.jsonl", block_on_critical=True)
+        resp = await client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": "..."}],
+        )
+        # Raises PreExecutionBlockedError when Claude attempts a critical action.
+
+    Design principles are identical to AuditedAnthropic (read-only interception,
+    append-only writes, deterministic logger). Audit writes are synchronous;
+    swap in an async-capable writer if the write path ever becomes a bottleneck.
+    """
+
+    def __init__(
+        self,
+        writer: Optional[BaseWriter] = None,
+        log_path: str = "./agentlens_audit.jsonl",
+        session_id: Optional[str] = None,
+        on_violation: Optional[OnViolation] = None,
+        on_pre_execution: Optional[OnPreExecution] = None,
+        block_on_critical: bool = False,
+        whitelist: Optional[Whitelist] = None,
+        **anthropic_kwargs,
+    ):
+        self._client = anthropic.AsyncAnthropic(**anthropic_kwargs)
+        self._writer = writer or FileWriter(log_path)
+        self._session_id = session_id or str(uuid.uuid4())
+        self._on_violation = on_violation or _default_on_violation
+
+        # on_pre_execution priority: explicit hook > block_on_critical flag > no-op
+        if on_pre_execution is not None:
+            self._on_pre_execution = on_pre_execution
+        else:
+            self._on_pre_execution = _make_pre_execution_hook(block_on_critical)
+
+        self.messages = AsyncAuditedMessages(
             self._client,
             self._writer,
             self._session_id,

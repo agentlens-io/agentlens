@@ -70,6 +70,25 @@ response = client.messages.create(
 # Every tool_use and tool_result is now in audit.jsonl
 ```
 
+### Async (v0.7.0+)
+
+`AsyncAuditedAnthropic` is the drop-in for `anthropic.AsyncAnthropic` — same
+audit logging and pre-execution blocking, awaited:
+
+```python
+from agentlens import AsyncAuditedAnthropic
+
+client = AsyncAuditedAnthropic(log_path="./audit.jsonl", block_on_critical=True)
+
+response = await client.messages.create(
+    model="claude-opus-4-6",
+    max_tokens=1024,
+    tools=[...],
+    messages=[{"role": "user", "content": "..."}],
+)
+# Raises PreExecutionBlockedError before a critical tool call reaches you.
+```
+
 ## Log format (JSONL)
 
 ```json
