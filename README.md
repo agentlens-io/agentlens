@@ -42,7 +42,10 @@ Now every tool call in Claude Code is audit-logged, and `rm -rf /`-class command
 agentlens view   ~/.agentlens/audit.jsonl        # colorized event viewer
 agentlens summary ~/.agentlens/audit.jsonl       # per-session stats
 agentlens verify ~/.agentlens/audit.jsonl        # ✅ hash-chain integrity / ❌ tamper detected
+agentlens feedback ~/.agentlens/audit.jsonl --emit-code   # suggest whitelist rules from suppressed violations (v0.8.0+)
 ```
+
+`feedback` reads the accumulated log — including the `suppressed_violations` that the whitelist keeps instead of deleting — and proposes narrowly-scoped `WhitelistRule`s for rules with a high false-positive rate. It is **suggestion-only**: it never rewrites your ruleset. A ruleset that auto-tunes from its own logs can be poisoned, so a human stays in the loop. Flags: `--min-occurrences N` (default 3), `--threshold F` (default 0.9), `--emit-code`.
 
 Options: `--block critical|high|off` (default `critical`), `--whitelist rules.json` (false-positive suppression — suppressed violations stay in the log), `--standalone` (post-hook logs tool_use+result when no pre-hook is registered). Hooks are **fail-open**: the logger can never break your agent loop.
 

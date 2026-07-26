@@ -236,6 +236,66 @@ def cmd_verify(path: Path) -> None:
         print(_c(f"✅ チェーン整合性OK  ({len(entries)} エントリ)", GREEN + BOLD))
 
 
+def cmd_feedback(
+    path: Path,
+    min_occurrences: int = 3,
+    fp_threshold: float = 0.9,
+    emit_code: bool = False,
+) -> None:
+    """蓄積ログを分析し、ホワイトリスト提案を出す（自動適用はしない）。"""
+    from .feedback import build_report
+
+    if not path.exists():
+        print(f"[error] ファイルが見つかりません: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    events = _load_events(path)
+    if not events:
+        print(_c("イベントがありません。", DIM))
+        return
+
+    report = build_report(events, min_occurrences, fp_threshold)
+
+    print()
+    print(_c("═" * 56, DIM))
+    print(_c("  agentlens  feedback loop", BOLD + CYAN))
+    print(_c("═" * 56, DIM))
+    print(f"  Tool Use            : {_c(str(report.total_events), BOLD)} 件")
+    print(f"  Active violations   : {_c(str(report.total_active), RED) if report.total_active else _c('0', GREEN)}")
+    print(f"  Suppressed (whitelist): {_c(str(report.total_suppressed), YELLOW)}")
+
+    if report.stats:
+        print()
+        print(_c("  ルール別 発火/抑制（誤検知率）:", BOLD))
+        for s in sorted(report.stats.values(), key=lambda x: x.total, reverse=True):
+            rate = _c(f"{s.fp_rate:.0%}", YELLOW if s.fp_rate >= fp_threshold else DIM)
+            print(f"    {s.rule_id.ljust(18)} active {str(s.active).rjust(3)}  "
+                  f"suppressed {str(s.suppressed).rjust(3)}  誤検知率 {rate}")
+
+    print()
+    if not report.suggestions:
+        print(_c("  提案なし（閾値を満たすルールがありません）。", GREEN))
+        print(_c("═" * 56, DIM))
+        print()
+        return
+
+    print(_c(f"  💡 ホワイトリスト提案（{len(report.suggestions)} 件・自動適用はしません）:", BOLD + CYAN))
+    print()
+    for i, sg in enumerate(report.suggestions, 1):
+        scope = f"tool={sg.tool_name}" if sg.tool_name else "全ツール"
+        print(_c(f"  [{i}] {sg.rule_id}  ({scope}, 抑制 {sg.occurrences} 件)", BOLD))
+        print(f"      {sg.rationale}")
+        if emit_code:
+            print(_c(f"      {sg.to_code()}", GREEN))
+        print()
+
+    if not emit_code:
+        print(_c("  --emit-code で貼り付け可能な WhitelistRule を出力します。", DIM))
+    print(_c("  レビューのうえ Whitelist に追加するかは人間が判断してください。", DIM))
+    print(_c("═" * 56, DIM))
+    print()
+
+
 def main(argv: Optional[list] = None) -> None:
     args = (argv if argv is not None else sys.argv)[1:]
 
@@ -244,6 +304,7 @@ def main(argv: Optional[list] = None) -> None:
         print("  python -m agentlens view <file.jsonl> [--session ID] [--violations-only]")
         print("  python -m agentlens summary <file.jsonl>")
         print("  python -m agentlens verify <file.jsonl>")
+        print("  python -m agentlens feedback <file.jsonl> [--min-occurrences N] [--threshold F] [--emit-code]")
         print("  agentlens hook <pre|post|install> [--log PATH] [--block critical|high|off]")
         sys.exit(1)
 
@@ -277,6 +338,25 @@ def main(argv: Optional[list] = None) -> None:
         if len(args) < 2:
             usage()
         cmd_verify(Path(args[1]))
+
+    elif subcmd == "feedback":
+        if len(args) < 2:
+            usage()
+        path = Path(args[1])
+        min_occurrences = 3
+        fp_threshold = 0.9
+        emit_code = False
+        i = 2
+        while i < len(args):
+            if args[i] == "--min-occurrences" and i + 1 < len(args):
+                min_occurrences = int(args[i + 1]); i += 2
+            elif args[i] == "--threshold" and i + 1 < len(args):
+                fp_threshold = float(args[i + 1]); i += 2
+            elif args[i] == "--emit-code":
+                emit_code = True; i += 1
+            else:
+                i += 1
+        cmd_feedback(path, min_occurrences, fp_threshold, emit_code)
 
     elif subcmd == "hook":
         from .hooks import main_hook
