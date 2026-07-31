@@ -324,3 +324,246 @@ def test_async_safe_tool_not_blocked(mock_async_cls):
     assert result is original
     assert len(writer.events) == 1
     assert writer.events[0].violations == []
+
+
+# ── Streaming tests (sync) ─────────────────────────────────────────────────
+# Fakes stand in for anthropic's MessageStream / MessageStreamManager so no
+# real API call is needed. Text events pass through; audit fires on completion.
+
+class FakeStream:
+    """Minimal stand-in for anthropic.lib.streaming.MessageStream."""
+    def __init__(self, final_message, events=None):
+        self._final = final_message
+        self._events = events or []
+
+    def __iter__(self):
+        return iter(self._events)
+
+    @property
+    def text_stream(self):
+        return iter(getattr(self, "_text", []))
+
+    def get_final_message(self):
+        return self._final
+
+
+class FakeStreamManager:
+    def __init__(self, stream):
+        self._stream = stream
+
+    def __enter__(self):
+        return self._stream
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _make_stream_client(mock_cls, final_message, writer, **kwargs):
+    mock_client = MagicMock()
+    mock_client.messages.stream.return_value = FakeStreamManager(FakeStream(final_message))
+    mock_cls.return_value = mock_client
+    return AuditedAnthropic(writer=writer, **kwargs)
+
+
+@patch("agentlens.client.anthropic.Anthropic")
+def test_stream_tool_use_is_logged(mock_anthropic_cls):
+    writer = MemoryWriter()
+    final = make_response([make_tool_use_block(name="bash", input={"command": "ls -la"})])
+    client = _make_stream_client(mock_anthropic_cls, final, writer, session_id="test-stream")
+
+    with client.messages.stream(
+        model="claude-opus-4-6", max_tokens=100,
+        messages=[{"role": "user", "content": "List files"}],
+    ) as stream:
+        message = stream.get_final_message()
+
+    assert message is final                    # passthrough: response not modified
+    assert len(writer.events) == 1
+    assert isinstance(writer.events[0], ToolUseEvent)
+    assert writer.events[0].tool_name == "bash"
+    assert writer.events[0].session_id == "test-stream"
+
+
+@patch("agentlens.client.anthropic.Anthropic")
+def test_stream_text_only_still_audits(mock_anthropic_cls):
+    """Caller that only iterates text (never calls get_final_message) is still audited on exit."""
+    writer = MemoryWriter()
+    final = make_response([make_tool_use_block(name="bash", input={"command": "ls -la"})])
+    client = _make_stream_client(mock_anthropic_cls, final, writer)
+
+    with client.messages.stream(
+        model="claude-opus-4-6", max_tokens=100,
+        messages=[{"role": "user", "content": "List files"}],
+    ) as stream:
+        for _ in stream:            # consume events, never ask for final message
+            pass
+
+    assert len(writer.events) == 1
+    assert writer.events[0].tool_name == "bash"
+
+
+@patch("agentlens.client.anthropic.Anthropic")
+def test_stream_audits_only_once(mock_anthropic_cls):
+    """get_final_message() inside the block + implicit exit must not double-log."""
+    writer = MemoryWriter()
+    final = make_response([make_tool_use_block(name="bash", input={"command": "ls -la"})])
+    client = _make_stream_client(mock_anthropic_cls, final, writer)
+
+    with client.messages.stream(
+        model="claude-opus-4-6", max_tokens=100,
+        messages=[{"role": "user", "content": "List files"}],
+    ) as stream:
+        stream.get_final_message()
+
+    assert len(writer.events) == 1
+
+
+@patch("agentlens.client.anthropic.Anthropic")
+def test_stream_block_on_critical_raises(mock_anthropic_cls):
+    """block_on_critical gates streaming too — raises before the caller acts on tool_use."""
+    writer = MemoryWriter()
+    final = make_response([make_tool_use_block(name="bash", input={"command": "rm -rf /"})])
+    client = _make_stream_client(mock_anthropic_cls, final, writer, block_on_critical=True)
+
+    with pytest.raises(PreExecutionBlockedError):
+        with client.messages.stream(
+            model="claude-opus-4-6", max_tokens=100,
+            messages=[{"role": "user", "content": "clean up"}],
+        ) as stream:
+            stream.get_final_message()
+
+    # Audit log written even when blocked
+    assert len(writer.events) == 1
+    assert len(writer.events[0].violations) > 0
+
+
+@patch("agentlens.client.anthropic.Anthropic")
+def test_stream_text_only_gate_raises_on_exit(mock_anthropic_cls):
+    """Even a text-only caller is gated: the block error surfaces on `with` exit."""
+    writer = MemoryWriter()
+    final = make_response([make_tool_use_block(name="bash", input={"command": "rm -rf /"})])
+    client = _make_stream_client(mock_anthropic_cls, final, writer, block_on_critical=True)
+
+    with pytest.raises(PreExecutionBlockedError):
+        with client.messages.stream(
+            model="claude-opus-4-6", max_tokens=100,
+            messages=[{"role": "user", "content": "clean up"}],
+        ) as stream:
+            for _ in stream:
+                pass
+
+    assert len(writer.events) == 1
+    assert len(writer.events[0].violations) > 0
+
+
+@patch("agentlens.client.anthropic.Anthropic")
+def test_stream_captures_inbound_tool_result(mock_anthropic_cls):
+    """tool_result blocks in the outbound request are captured on stream() too."""
+    writer = MemoryWriter()
+    client = _make_stream_client(mock_anthropic_cls, make_response([]), writer)
+
+    with client.messages.stream(
+        model="claude-opus-4-6", max_tokens=100,
+        messages=[{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_xyz", "content": "file1.txt", "is_error": False}
+        ]}],
+    ) as stream:
+        stream.get_final_message()
+
+    assert any(isinstance(e, ToolResultEvent) and e.tool_use_id == "toolu_xyz" for e in writer.events)
+
+
+# ── Streaming tests (async) ────────────────────────────────────────────────
+
+class FakeAsyncStream:
+    def __init__(self, final_message, events=None):
+        self._final = final_message
+        self._events = events or []
+
+    def __aiter__(self):
+        async def gen():
+            for e in self._events:
+                yield e
+        return gen()
+
+    async def get_final_message(self):
+        return self._final
+
+
+class FakeAsyncStreamManager:
+    def __init__(self, stream):
+        self._stream = stream
+
+    async def __aenter__(self):
+        return self._stream
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _make_async_stream_client(mock_cls, final_message, writer, **kwargs):
+    mock_client = MagicMock()
+    mock_client.messages.stream = MagicMock(
+        return_value=FakeAsyncStreamManager(FakeAsyncStream(final_message))
+    )
+    mock_cls.return_value = mock_client
+    return AsyncAuditedAnthropic(writer=writer, **kwargs)
+
+
+@patch("agentlens.client.anthropic.AsyncAnthropic")
+def test_async_stream_tool_use_is_logged(mock_async_cls):
+    writer = MemoryWriter()
+    final = make_response([make_tool_use_block(name="bash", input={"command": "ls -la"})])
+    client = _make_async_stream_client(mock_async_cls, final, writer, session_id="test-astream")
+
+    async def run():
+        async with client.messages.stream(
+            model="claude-opus-4-6", max_tokens=100,
+            messages=[{"role": "user", "content": "List files"}],
+        ) as stream:
+            return await stream.get_final_message()
+
+    message = asyncio.run(run())
+    assert message is final
+    assert len(writer.events) == 1
+    assert writer.events[0].tool_name == "bash"
+    assert writer.events[0].session_id == "test-astream"
+
+
+@patch("agentlens.client.anthropic.AsyncAnthropic")
+def test_async_stream_text_only_still_audits(mock_async_cls):
+    writer = MemoryWriter()
+    final = make_response([make_tool_use_block(name="bash", input={"command": "ls -la"})])
+    client = _make_async_stream_client(mock_async_cls, final, writer)
+
+    async def run():
+        async with client.messages.stream(
+            model="claude-opus-4-6", max_tokens=100,
+            messages=[{"role": "user", "content": "List files"}],
+        ) as stream:
+            async for _ in stream:
+                pass
+
+    asyncio.run(run())
+    assert len(writer.events) == 1
+    assert writer.events[0].tool_name == "bash"
+
+
+@patch("agentlens.client.anthropic.AsyncAnthropic")
+def test_async_stream_block_on_critical_raises(mock_async_cls):
+    writer = MemoryWriter()
+    final = make_response([make_tool_use_block(name="bash", input={"command": "rm -rf /"})])
+    client = _make_async_stream_client(mock_async_cls, final, writer, block_on_critical=True)
+
+    async def run():
+        async with client.messages.stream(
+            model="claude-opus-4-6", max_tokens=100,
+            messages=[{"role": "user", "content": "clean up"}],
+        ) as stream:
+            await stream.get_final_message()
+
+    with pytest.raises(PreExecutionBlockedError):
+        asyncio.run(run())
+
+    assert len(writer.events) == 1
+    assert len(writer.events[0].violations) > 0

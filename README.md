@@ -92,6 +92,26 @@ response = await client.messages.create(
 # Raises PreExecutionBlockedError before a critical tool call reaches you.
 ```
 
+### Streaming (v0.9.0+)
+
+`messages.stream()` is wrapped too. Text passes through untouched; the audit
+and the pre-execution gate fire when the message completes — before your code
+reads the finished `tool_use` and acts on it. Works on the sync and async
+clients:
+
+```python
+with client.messages.stream(
+    model="claude-opus-4-6",
+    max_tokens=1024,
+    tools=[...],
+    messages=[{"role": "user", "content": "..."}],
+) as stream:
+    for text in stream.text_stream:
+        print(text, end="")
+    message = stream.get_final_message()  # tool_use audited + gated here
+# block_on_critical raises PreExecutionBlockedError before you touch tool_use.
+```
+
 ## Log format (JSONL)
 
 ```json

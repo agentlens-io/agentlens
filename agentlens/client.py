@@ -121,6 +121,147 @@ class _AuditCore:
             raise block_to_raise
 
 
+class AuditedMessageStream:
+    """Read-only wrapper around a live anthropic MessageStream.
+
+    Text/event iteration is forwarded untouched — the byte stream the caller
+    sees is identical to the unwrapped SDK. The audit + pre-execution gate run
+    exactly once, when the *complete* message is available (get_final_message),
+    or when the `with` block ends if the caller only consumed text. Because
+    tool execution happens in the caller's code *after* it reads tool_use from
+    the finished message, gating here is still "before execution".
+    """
+
+    def __init__(self, stream: Any, core: "_AuditCore"):
+        self._stream = stream
+        self._core = core
+        self._processed = False
+
+    # ── read-only passthrough of the live stream ──────────────────────────
+    def __iter__(self):
+        return self._stream.__iter__()
+
+    def __next__(self):
+        return self._stream.__next__()
+
+    @property
+    def text_stream(self):
+        return self._stream.text_stream
+
+    def get_final_text(self):
+        return self._stream.get_final_text()
+
+    def until_done(self):
+        self._stream.until_done()
+
+    def close(self):
+        self._stream.close()
+
+    def __getattr__(self, name):
+        # Anything we don't override (response, request_id, current_message_snapshot, …)
+        return getattr(self._stream, name)
+
+    # ── audit + gate (runs once) ──────────────────────────────────────────
+    def _process_once(self) -> Any:
+        message = self._stream.get_final_message()
+        if not self._processed:
+            self._processed = True
+            self._core._process_response(message)   # may raise PreExecutionBlockedError
+        return message
+
+    def get_final_message(self) -> Any:
+        # Audit + gate happen here, before the caller can act on tool_use.
+        return self._process_once()
+
+
+class AuditedMessageStreamManager:
+    """Wraps the context manager returned by messages.stream().
+
+    On enter, yields an AuditedMessageStream. On a clean exit, ensures the
+    audit + gate ran even if the caller only iterated text and never asked for
+    the final message — so streaming callers cannot silently skip the log.
+    """
+
+    def __init__(self, manager: Any, core: "_AuditCore"):
+        self._manager = manager
+        self._core = core
+        self._stream: Optional[AuditedMessageStream] = None
+
+    def __enter__(self) -> AuditedMessageStream:
+        raw = self._manager.__enter__()
+        self._stream = AuditedMessageStream(raw, self._core)
+        return self._stream
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None and self._stream is not None:
+                self._stream._process_once()   # gate may raise; finally still closes
+        finally:
+            self._manager.__exit__(exc_type, exc, tb)
+
+
+class AsyncAuditedMessageStream:
+    """Async counterpart of AuditedMessageStream. Same guarantees, awaited."""
+
+    def __init__(self, stream: Any, core: "_AuditCore"):
+        self._stream = stream
+        self._core = core
+        self._processed = False
+
+    def __aiter__(self):
+        return self._stream.__aiter__()
+
+    async def __anext__(self):
+        return await self._stream.__anext__()
+
+    @property
+    def text_stream(self):
+        return self._stream.text_stream
+
+    async def get_final_text(self):
+        return await self._stream.get_final_text()
+
+    async def until_done(self):
+        await self._stream.until_done()
+
+    async def close(self):
+        await self._stream.close()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+    async def _process_once(self) -> Any:
+        message = await self._stream.get_final_message()
+        if not self._processed:
+            self._processed = True
+            self._core._process_response(message)   # sync, deterministic
+        return message
+
+    async def get_final_message(self) -> Any:
+        return await self._process_once()
+
+
+class AsyncAuditedMessageStreamManager:
+    """Async counterpart of AuditedMessageStreamManager."""
+
+    def __init__(self, manager: Any, core: "_AuditCore"):
+        self._manager = manager
+        self._core = core
+        self._stream: Optional[AsyncAuditedMessageStream] = None
+
+    async def __aenter__(self) -> AsyncAuditedMessageStream:
+        raw = await self._manager.__aenter__()
+        self._stream = AsyncAuditedMessageStream(raw, self._core)
+        return self._stream
+
+    async def __aexit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None and self._stream is not None:
+                await self._stream._process_once()
+        finally:
+            await self._manager.__aexit__(exc_type, exc, tb)
+
+
 class AuditedMessages(_AuditCore):
     """Wraps anthropic.resources.Messages (synchronous).
 
@@ -134,6 +275,11 @@ class AuditedMessages(_AuditCore):
         response = self._client.messages.create(**kwargs)   # read-only forward
         self._process_response(response)
         return response
+
+    def stream(self, **kwargs) -> AuditedMessageStreamManager:
+        self._capture_tool_results(kwargs)
+        manager = self._client.messages.stream(**kwargs)   # read-only forward
+        return AuditedMessageStreamManager(manager, self)
 
 
 class AsyncAuditedMessages(_AuditCore):
@@ -149,6 +295,11 @@ class AsyncAuditedMessages(_AuditCore):
         response = await self._client.messages.create(**kwargs)   # read-only forward
         self._process_response(response)
         return response
+
+    def stream(self, **kwargs) -> AsyncAuditedMessageStreamManager:
+        self._capture_tool_results(kwargs)
+        manager = self._client.messages.stream(**kwargs)   # read-only forward
+        return AsyncAuditedMessageStreamManager(manager, self)
 
 
 class AuditedAnthropic:
@@ -174,6 +325,17 @@ class AuditedAnthropic:
                 raise PreExecutionBlockedError(event, violations)
 
         client = AuditedAnthropic(on_pre_execution=my_hook)
+
+    Usage — streaming (audit + gate fire when the message completes):
+        with client.messages.stream(
+            model="claude-opus-4-6", max_tokens=1024,
+            messages=[{"role": "user", "content": "..."}],
+        ) as stream:
+            for text in stream.text_stream:
+                print(text, end="")
+            message = stream.get_final_message()  # tool_use audited + gated here
+        # Text passes through untouched; PreExecutionBlockedError raises before
+        # the caller can act on any critical tool_use.
 
     Design principles:
         - Read-only interception: requests/responses are never altered
