@@ -112,11 +112,37 @@ with client.messages.stream(
 # block_on_critical raises PreExecutionBlockedError before you touch tool_use.
 ```
 
+### Provenance — who ran the agent (v0.10.0+)
+
+The log answers *what* happened. Provenance adds *who* caused it and *under what
+authority* — stamped onto every event so a reader can prove attribution later.
+
+```python
+from agentlens import AuditedAnthropic, Provenance
+
+client = AuditedAnthropic(
+    log_path="./audit.jsonl",
+    provenance=Provenance(
+        agent_id="deploy-bot",            # which agent
+        principal="alice@corp",           # on whose behalf
+        authority=["repo:read", "ci:run"],# scopes it was granted
+        # run_id auto-generated; pass parent_run_id to record lineage
+    ),
+)
+```
+
+Hosted/CI agents usually get their identity from the platform via env, so
+`Provenance.from_env()` reads `AGENTLENS_AGENT_ID`, `AGENTLENS_PRINCIPAL`,
+`AGENTLENS_AUTHORITY` (comma/space separated), `AGENTLENS_RUN_ID`,
+`AGENTLENS_PARENT_RUN_ID`. Provenance is **recorded, not enforced** — and it is
+covered by the hash chain, so tampering with *who did it* breaks `verify` too.
+`agentlens view` shows a `by:` line per call; `summary` breaks Tool Use down by agent.
+
 ## Log format (JSONL)
 
 ```json
-{"event_type": "tool_use", "tool_use_id": "toolu_01xxx", "tool_name": "bash", "tool_input": {"command": "ls -la"}, "model": "claude-opus-4-6", "timestamp": "2026-04-05T10:00:00+00:00", "session_id": "..."}
-{"event_type": "tool_result", "tool_use_id": "toolu_01xxx", "result_content": "file1.txt\nfile2.txt", "is_error": false, "timestamp": "2026-04-05T10:00:01+00:00", "session_id": "..."}
+{"event_type": "tool_use", "tool_use_id": "toolu_01xxx", "tool_name": "bash", "tool_input": {"command": "ls -la"}, "model": "claude-opus-4-6", "timestamp": "2026-04-05T10:00:00+00:00", "session_id": "...", "provenance": {"agent_id": "deploy-bot", "principal": "alice@corp", "authority": ["repo:read"], "run_id": "..."}}
+{"event_type": "tool_result", "tool_use_id": "toolu_01xxx", "result_content": "file1.txt\nfile2.txt", "is_error": false, "timestamp": "2026-04-05T10:00:01+00:00", "session_id": "...", "provenance": {"agent_id": "deploy-bot", "run_id": "..."}}
 ```
 
 ## Custom writer

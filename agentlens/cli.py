@@ -66,6 +66,25 @@ def _format_result(result_content) -> str:
     return text[:200] + ("…" if len(text) > 200 else "")
 
 
+def _format_provenance(prov: dict) -> str:
+    """One-line 'who ran this, under what authority' summary, or '' if absent."""
+    if not prov:
+        return ""
+    parts = []
+    if prov.get("agent_id"):
+        parts.append(f"agent={prov['agent_id']}")
+    if prov.get("principal"):
+        parts.append(f"principal={prov['principal']}")
+    if prov.get("authority"):
+        parts.append(f"auth=[{','.join(prov['authority'])}]")
+    run_id = prov.get("run_id") or ""
+    if run_id:
+        parts.append(f"run={run_id[:8]}")
+    if prov.get("parent_run_id"):
+        parts.append(f"parent={prov['parent_run_id'][:8]}")
+    return "  ".join(parts)
+
+
 def _severity_color(severity: str) -> str:
     return {
         "critical": RED + BOLD,
@@ -109,6 +128,9 @@ def cmd_view(path: Path, session: Optional[str], violations_only: bool) -> None:
             tool_input = ev.get("tool_input", {})
             print(f"\n{_c(ts, GRAY)}  {_c('TOOL USE', BOLD + GREEN)}  →  {_c(tool_name, BOLD)}")
             print(f"  {_c('input:', DIM)} {_format_input(tool_input)}")
+            prov = _format_provenance(ev.get("provenance", {}))
+            if prov:
+                print(f"  {_c('by:', DIM)} {_c(prov, CYAN)}")
 
         elif ev_type == "tool_result":
             result  = ev.get("result_content", "")
@@ -175,6 +197,22 @@ def cmd_summary(path: Path) -> None:
         print(_c("  ツール使用 TOP5:", BOLD))
         for tool, cnt in tool_counts.most_common(5):
             print(f"    {str(cnt).rjust(4)}  {tool}")
+
+    # provenance breakdown: who ran the agents (Layer B)
+    def _actor(e: dict) -> Optional[str]:
+        p = e.get("provenance") or {}
+        agent = p.get("agent_id") or ""
+        principal = p.get("principal") or ""
+        if not agent and not principal:
+            return None
+        return f"{agent or '?'}" + (f" ({principal})" if principal else "")
+
+    actor_counts = Counter(a for e in tool_uses if (a := _actor(e)))
+    if actor_counts:
+        print()
+        print(_c("  エージェント別 Tool Use:", BOLD))
+        for actor, cnt in actor_counts.most_common(5):
+            print(f"    {str(cnt).rjust(4)}  {actor}")
 
     print(_c("═" * 50, DIM))
     print()
