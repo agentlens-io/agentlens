@@ -6,6 +6,7 @@ import anthropic
 
 from .models import ToolUseEvent, ToolResultEvent, PreExecutionBlockedError, normalize_provenance
 from .rules import check, Violation
+from .authority import AuthorityPolicy
 from .whitelist import Whitelist, WhitelistRule
 from .writers.base import BaseWriter
 from .writers.file import FileWriter
@@ -48,6 +49,7 @@ class _AuditCore:
         on_pre_execution: OnPreExecution,
         whitelist: Optional[Whitelist] = None,
         provenance: Optional[dict] = None,
+        authority_policy: Optional[AuthorityPolicy] = None,
     ):
         self._client = client
         self._writer = writer
@@ -56,6 +58,7 @@ class _AuditCore:
         self._on_pre_execution = on_pre_execution
         self._whitelist = whitelist
         self._provenance = provenance or {}
+        self._authority_policy = authority_policy
 
     def _capture_tool_results(self, kwargs: dict) -> None:
         """Capture tool_result blocks from inbound messages (post-execution facts)."""
@@ -96,6 +99,10 @@ class _AuditCore:
                 provenance=self._provenance,
             )
             all_violations = check(event)
+
+            # Authority enforcement (Layer B): block tools outside the granted scope
+            if self._authority_policy is not None:
+                all_violations = all_violations + self._authority_policy.check(event)
 
             # Apply whitelist: partition into active vs suppressed
             if self._whitelist and all_violations:
@@ -359,6 +366,7 @@ class AuditedAnthropic:
         block_on_critical: bool = False,
         whitelist: Optional[Whitelist] = None,
         provenance: Any = None,
+        authority_policy: Optional[AuthorityPolicy] = None,
         **anthropic_kwargs,
     ):
         self._client = anthropic.Anthropic(**anthropic_kwargs)
@@ -380,6 +388,7 @@ class AuditedAnthropic:
             self._on_pre_execution,
             whitelist=whitelist,
             provenance=normalize_provenance(provenance),
+            authority_policy=authority_policy,
         )
 
 
@@ -415,6 +424,7 @@ class AsyncAuditedAnthropic:
         block_on_critical: bool = False,
         whitelist: Optional[Whitelist] = None,
         provenance: Any = None,
+        authority_policy: Optional[AuthorityPolicy] = None,
         **anthropic_kwargs,
     ):
         self._client = anthropic.AsyncAnthropic(**anthropic_kwargs)
@@ -436,4 +446,5 @@ class AsyncAuditedAnthropic:
             self._on_pre_execution,
             whitelist=whitelist,
             provenance=normalize_provenance(provenance),
+            authority_policy=authority_policy,
         )

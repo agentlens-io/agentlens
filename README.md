@@ -134,9 +134,37 @@ client = AuditedAnthropic(
 Hosted/CI agents usually get their identity from the platform via env, so
 `Provenance.from_env()` reads `AGENTLENS_AGENT_ID`, `AGENTLENS_PRINCIPAL`,
 `AGENTLENS_AUTHORITY` (comma/space separated), `AGENTLENS_RUN_ID`,
-`AGENTLENS_PARENT_RUN_ID`. Provenance is **recorded, not enforced** — and it is
-covered by the hash chain, so tampering with *who did it* breaks `verify` too.
-`agentlens view` shows a `by:` line per call; `summary` breaks Tool Use down by agent.
+`AGENTLENS_PARENT_RUN_ID`. Provenance is covered by the hash chain, so tampering
+with *who did it* breaks `verify` too. `agentlens view` shows a `by:` line per
+call; `summary` breaks Tool Use down by agent. In v0.10 authority is *recorded*;
+`AuthorityPolicy` (below) turns it into *enforcement*.
+
+### Authority enforcement — stay inside the granted scope (v0.11.0+)
+
+v0.10 recorded the `authority` an agent was granted. `AuthorityPolicy` enforces
+it: a tool whose required scopes aren't all present in the agent's granted
+authority raises a **critical** violation, blocked by the same
+`block_on_critical` gate as the danger rules. Record → enforce.
+
+```python
+from agentlens import AuditedAnthropic, AuthorityPolicy, Provenance
+
+client = AuditedAnthropic(
+    log_path="./audit.jsonl",
+    block_on_critical=True,
+    provenance=Provenance(agent_id="deploy-bot", authority=["repo:read"]),
+    authority_policy=AuthorityPolicy(
+        requirements={"bash": ["shell:exec"], "web_search": ["web:fetch"]},
+        # default_required=["*"] for deny-by-default once your scope map is complete
+    ),
+)
+# deploy-bot was granted only repo:read → a bash tool_use is blocked before it runs.
+```
+
+Enforcement is **opt-in** (no policy → identical to v0.10, pure recording). A
+tool is allowed iff *every* scope it requires is granted (AND semantics);
+unmapped tools are allowed unless you set `default_required`. `"*"` in the
+granted authority is a super-scope that allows everything.
 
 ## Log format (JSONL)
 
